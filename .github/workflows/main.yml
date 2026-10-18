@@ -46,7 +46,7 @@ jobs:
               id 'net.minecraftforge.gradle' version '[6.0,6.2)'
           }
 
-          version = '1.0.0'
+          version = '2.0.0'
           group = 'ru.herda.bhop'
           base { archivesName = 'herdabhop' }
 
@@ -76,7 +76,7 @@ jobs:
                   attributes([
                       'Specification-Title'   : 'herdabhop',
                       'Specification-Vendor'  : 'Herda',
-                      'Specification-Version' : '1',
+                      'Specification-Version' : '2',
                       'Implementation-Title'  : project.name,
                       'Implementation-Version': project.version,
                       'Implementation-Vendor' : 'Herda'
@@ -96,12 +96,10 @@ jobs:
           license="MIT"
           [[mods]]
           modId="herdabhop"
-          version="1.0.0"
+          version="2.0.0"
           displayName="Herda CS2 Bhop"
           authors="Herda"
-          description='''
-          CS2 / Source-style BunnyHop & Air-Strafe Mod for Minecraft 1.20.1 with In-Game Settings GUI, Velocity HUD (u/s), Keystrokes and Configurable Physics.
-          '''
+          description="Authentic CS2 / Source Engine SV_AirAccelerate BunnyHop & Air-Strafe Mod for Minecraft 1.20.1"
           [[dependencies.herdabhop]]
               modId="forge"
               mandatory=true
@@ -145,85 +143,117 @@ jobs:
           package ru.herda.bhop;
 
           public final class BhopMath {
-              // В CS2 250 u/s соответствует базовой скорости бега с ножом (~4.317 блоков/с = 0.21585 блоков/тик)
-              public static final double CS2_UNITS_PER_BLOCK_TICK = 1158.0;
+              // 0.25 blocks/tick (5.0 m/s) = 250 u/s (CS2 knife running speed)
+              public static final double CS2_UNITS_PER_BLOCK_TICK = 1000.0;
+              public static final double BASE_KNIFE_SPEED_UPS = 250.0;
+              public static final double BASE_KNIFE_SPEED_BPT = BASE_KNIFE_SPEED_UPS / CS2_UNITS_PER_BLOCK_TICK;
 
               private BhopMath() {}
 
-              public static int toCs2UnitsPerSec(double dx, double dz) {
-                  double horizontalSpeedPerTick = Math.sqrt(dx * dx + dz * dz);
-                  if (!Double.isFinite(horizontalSpeedPerTick)) return 0;
-                  return (int) Math.round(horizontalSpeedPerTick * CS2_UNITS_PER_BLOCK_TICK);
+              public static int toCs2UnitsPerSec(double vx, double vz) {
+                  double speed = Math.hypot(vx, vz);
+                  if (!Double.isFinite(speed)) return 0;
+                  return (int) Math.round(speed * CS2_UNITS_PER_BLOCK_TICK);
               }
 
-              public static double[] applySourceAirAccelerate(
-                  double vx, double vz,
-                  float yawDeg, float forwardInput, float strafeInput,
-                  float mouseYawDelta,
-                  double airAccelStrength, double maxSpeedPerTick
-              ) {
-                  if (!Double.isFinite(vx) || !Double.isFinite(vz)) {
-                      return new double[]{0.0, 0.0};
-                  }
+              public static float wrapDegrees(float deg) {
+                  float d = deg % 360.0F;
+                  if (d >= 180.0F) d -= 360.0F;
+                  if (d < -180.0F) d += 360.0F;
+                  return d;
+              }
 
-                  // Если игрок зажимает A/D или ведёт мышью в полёте — работает векторное ускорение Source Engine
-                  double wishForward = forwardInput;
-                  double wishStrafe = strafeInput;
-
-                  // Авто-стрейф от движения мыши, если игрок крутит камерой в прыжке
-                  if (Math.abs(wishStrafe) < 0.05 && Math.abs(mouseYawDelta) > 0.35F) {
-                      wishStrafe = mouseYawDelta > 0.0F ? -1.0 : 1.0;
-                  }
-
-                  double mag = Math.sqrt(wishForward * wishForward + wishStrafe * wishStrafe);
-                  if (mag < 1.0E-4) {
-                      return new double[]{vx, vz};
-                  }
-                  wishForward /= mag;
-                  wishStrafe /= mag;
-
+              /**
+               * Computes unit wish direction in Minecraft world coordinates (X, Z) from camera yaw and CS2 fmove/smove.
+               * fmove: +1 for W, -1 for S
+               * smove: +1 for D (Right), -1 for A (Left)
+               */
+              public static double[] computeWishDir(float yawDeg, float fmove, float smove) {
+                  double mag = Math.hypot(fmove, smove);
+                  if (mag < 1.0E-4D) return new double[]{0.0, 0.0};
+                  double nf = fmove / mag;
+                  double ns = smove / mag;
                   double rad = Math.toRadians(yawDeg);
                   double sin = Math.sin(rad);
                   double cos = Math.cos(rad);
+                  // Forward (+fmove) = (-sin, +cos); Right (+smove, D) = (-cos, -sin); Left (-smove, A) = (+cos, +sin)
+                  double wx = -sin * nf - cos * ns;
+                  double wz =  cos * nf - sin * ns;
+                  return new double[]{wx, wz};
+              }
 
-                  // Направление желаемого ускорения в мировых координатах Minecraft
-                  double wishX = -sin * wishForward + cos * wishStrafe;
-                  double wishZ =  cos * wishForward + sin * wishStrafe;
-
-                  double currentSpeed = Math.sqrt(vx * vx + vz * vz);
-                  double projSpeed = vx * wishX + vz * wishZ;
-                  double wishSpeedCap = 0.065 * airAccelStrength;
-                  double addSpeed = wishSpeedCap - projSpeed;
-
-                  if (addSpeed > 0.0) {
-                      double accelStep = Math.min(addSpeed, 0.032 * airAccelStrength);
-                      vx += wishX * accelStep;
-                      vz += wishZ * accelStep;
+              /**
+               * Authentic 16-substep (320 Hz effective tickrate) Valve Source Engine / CS2 SV_AirAccelerate.
+               * Eliminates 20Hz quantization loss by interpolating yaw across 16 sub-steps per Minecraft tick.
+               * Returns {newVx, newVz, syncFraction}.
+               */
+              public static double[] stepSourceAirAccelerate(
+                  double vx, double vz,
+                  float prevYawDeg, float currYawDeg,
+                  float fmove, float smove,
+                  boolean strictWRelease,
+                  double svAirAccelerate,
+                  double airWishCapUps,
+                  double maxSpeedUps
+              ) {
+                  if (!Double.isFinite(vx) || !Double.isFinite(vz)) {
+                      return new double[]{0.0, 0.0, 0.0};
                   }
 
-                  // Поворот вектора скорости за прицелом при плавном стрейфе мышью (CS2 air control)
-                  if (Math.abs(mouseYawDelta) > 0.1F && Math.abs(strafeInput) > 0.1F) {
-                      boolean synced = (mouseYawDelta > 0.0F && strafeInput < 0.0F) || (mouseYawDelta < 0.0F && strafeInput > 0.0F);
-                      if (synced) {
-                          double turnRad = Math.toRadians(Math.max(-14.0F, Math.min(14.0F, mouseYawDelta)) * 0.65);
-                          double c = Math.cos(turnRad);
-                          double s = Math.sin(turnRad);
-                          double rvx = vx * c - vz * s;
-                          double rvz = vx * s + vz * c;
-                          double boost = 1.0 + 0.018 * airAccelStrength;
-                          vx = rvx * boost;
-                          vz = rvz * boost;
+                  double ux = vx * CS2_UNITS_PER_BLOCK_TICK;
+                  double uz = vz * CS2_UNITS_PER_BLOCK_TICK;
+
+                  // In Smart CS2 mode (strictWRelease = false), pressing A or D in air uses pure 90-deg strafe vector
+                  // even if the player forgot to release W. Holding W alone (smove == 0) still uses forward vector (no free bhop speed).
+                  float effFmove = (!strictWRelease && Math.abs(smove) > 0.01F) ? 0.0F : fmove;
+                  float effSmove = smove;
+
+                  double wishMag = Math.hypot(effFmove, effSmove);
+                  if (wishMag < 1.0E-4D) {
+                      // Source Engine has 0% air friction/drag when coasting in the air
+                      return new double[]{vx, vz, 0.0};
+                  }
+                  effFmove /= (float) wishMag;
+                  effSmove /= (float) wishMag;
+
+                  float deltaYaw = wrapDegrees(currYawDeg - prevYawDeg);
+                  int substeps = 16;
+                  double dt = 0.05D / substeps;
+                  double wishspeed = BASE_KNIFE_SPEED_UPS;
+                  int syncedSteps = 0;
+
+                  for (int s = 0; s < substeps; s++) {
+                      float subYaw = prevYawDeg + deltaYaw * ((s + 1) / (float) substeps);
+                      double rad = Math.toRadians(subYaw);
+                      double sin = Math.sin(rad);
+                      double cos = Math.cos(rad);
+
+                      double wishX = -sin * effFmove - cos * effSmove;
+                      double wishZ =  cos * effFmove - sin * effSmove;
+
+                      double currentspeed = ux * wishX + uz * wishZ;
+                      double addspeed = airWishCapUps - currentspeed;
+
+                      if (addspeed > 0.0D) {
+                          double accelspeed = Math.min(addspeed, svAirAccelerate * wishspeed * dt);
+                          double prevSpd = Math.hypot(ux, uz);
+                          ux += accelspeed * wishX;
+                          uz += accelspeed * wishZ;
+                          if (Math.hypot(ux, uz) > prevSpd + 0.005D) {
+                              syncedSteps++;
+                          }
                       }
                   }
 
-                  double newSpeed = Math.sqrt(vx * vx + vz * vz);
-                  if (newSpeed > maxSpeedPerTick && newSpeed > 1.0E-5) {
-                      double scale = maxSpeedPerTick / newSpeed;
-                      vx *= scale;
-                      vz *= scale;
+                  double newSpeedUps = Math.hypot(ux, uz);
+                  if (newSpeedUps > maxSpeedUps && newSpeedUps > 1.0E-5D) {
+                      double scale = maxSpeedUps / newSpeedUps;
+                      ux *= scale;
+                      uz *= scale;
                   }
 
-                  return new double[]{vx, vz};
+                  double sync = syncedSteps / (double) substeps;
+                  return new double[]{ux / CS2_UNITS_PER_BLOCK_TICK, uz / CS2_UNITS_PER_BLOCK_TICK, sync};
               }
           }
           """)
@@ -239,25 +269,29 @@ jobs:
               public static final ForgeConfigSpec.BooleanValue BHOP_ENABLED;
               public static final ForgeConfigSpec.BooleanValue AUTO_JUMP;
               public static final ForgeConfigSpec.BooleanValue AIR_STRAFE;
+              public static final ForgeConfigSpec.BooleanValue STRICT_W_RELEASE;
               public static final ForgeConfigSpec.BooleanValue SHOW_HUD;
               public static final ForgeConfigSpec.BooleanValue SHOW_KEYSTROKES;
               public static final ForgeConfigSpec.BooleanValue NO_FALL_DAMAGE;
+              public static final ForgeConfigSpec.DoubleValue SV_AIRACCELERATE;
+              public static final ForgeConfigSpec.DoubleValue AIR_WISH_CAP_UPS;
               public static final ForgeConfigSpec.DoubleValue HOP_SPEED_BOOST;
-              public static final ForgeConfigSpec.DoubleValue AIR_ACCELERATE;
-              public static final ForgeConfigSpec.DoubleValue MAX_SPEED_CAP;
+              public static final ForgeConfigSpec.DoubleValue MAX_SPEED_UPS;
 
               static {
                   ForgeConfigSpec.Builder b = new ForgeConfigSpec.Builder();
-                  b.push("cs2_bhop_settings");
+                  b.push("cs2_bhop_physics_v2");
                   BHOP_ENABLED = b.define("bhopEnabled", true);
                   AUTO_JUMP = b.define("autoJumpHoldSpace", true);
                   AIR_STRAFE = b.define("cs2AirStrafe", true);
+                  STRICT_W_RELEASE = b.define("strictWReleaseInAir", false);
                   SHOW_HUD = b.define("showVelocityHud", true);
                   SHOW_KEYSTROKES = b.define("showKeystrokes", true);
                   NO_FALL_DAMAGE = b.define("disableFallDamageWhenBhopping", true);
-                  HOP_SPEED_BOOST = b.defineInRange("hopSpeedBoost", 1.14, 1.0, 2.0);
-                  AIR_ACCELERATE = b.defineInRange("airAccelerate", 1.25, 0.2, 4.0);
-                  MAX_SPEED_CAP = b.defineInRange("maxSpeedPerTick", 0.78, 0.25, 2.5); // ~900 u/s default cap
+                  SV_AIRACCELERATE = b.defineInRange("svAirAccelerate", 100.0, 10.0, 1000.0);
+                  AIR_WISH_CAP_UPS = b.defineInRange("svAirMaxWishspeedUps", 42.0, 20.0, 120.0);
+                  HOP_SPEED_BOOST = b.defineInRange("landingSpeedMultiplier", 1.00, 1.00, 1.50);
+                  MAX_SPEED_UPS = b.defineInRange("maxSpeedUps", 950.0, 300.0, 3500.0);
                   b.pop();
                   SPEC = b.build();
               }
@@ -318,12 +352,11 @@ jobs:
                   this.clearWidgets();
 
                   int cx = this.width / 2;
-                  int startY = Math.max(36, this.height / 2 - 88);
-                  int bw = 220;
+                  int startY = Math.max(30, this.height / 2 - 96);
+                  int bw = 240;
                   int bh = 20;
-                  int step = 24;
+                  int step = 23;
 
-                  // 1. Вкл/Выкл Bhop
                   this.addRenderableWidget(Button.builder(
                       Component.literal("CS2 Bhop: " + (BhopClient.bhopEnabled ? "§aON" : "§cOFF")),
                       btn -> {
@@ -333,9 +366,8 @@ jobs:
                       }
                   ).bounds(cx - bw / 2, startY, bw, bh).build());
 
-                  // 2. Auto-Jump при удержании пробела
                   this.addRenderableWidget(Button.builder(
-                      Component.literal("Auto-Jump (Hold Space): " + (BhopClient.autoJump ? "§aON" : "§cOFF")),
+                      Component.literal("Auto-Jump (Hold SPACE): " + (BhopClient.autoJump ? "§aON" : "§cOFF")),
                       btn -> {
                           BhopClient.autoJump = !BhopClient.autoJump;
                           HerdaBhopConfig.AUTO_JUMP.set(BhopClient.autoJump);
@@ -343,59 +375,64 @@ jobs:
                       }
                   ).bounds(cx - bw / 2, startY + step, bw, bh).build());
 
-                  // 3. CS2 Air-Strafe
                   this.addRenderableWidget(Button.builder(
-                      Component.literal("CS2 Air-Strafe (A/D + Mouse): " + (BhopClient.airStrafe ? "§aON" : "§cOFF")),
+                      Component.literal("Preset: §e" + getPresetName(BhopClient.airWishCapUps)),
                       btn -> {
-                          BhopClient.airStrafe = !BhopClient.airStrafe;
-                          HerdaBhopConfig.AIR_STRAFE.set(BhopClient.airStrafe);
+                          if (BhopClient.airWishCapUps <= 32.0) {
+                              BhopClient.svAirAccelerate = 100.0;
+                              BhopClient.airWishCapUps = 42.0;
+                          } else if (BhopClient.airWishCapUps <= 44.0) {
+                              BhopClient.svAirAccelerate = 150.0;
+                              BhopClient.airWishCapUps = 54.0;
+                          } else if (BhopClient.airWishCapUps <= 58.0) {
+                              BhopClient.svAirAccelerate = 250.0;
+                              BhopClient.airWishCapUps = 72.0;
+                          } else {
+                              BhopClient.svAirAccelerate = 12.0;
+                              BhopClient.airWishCapUps = 30.0;
+                          }
+                          HerdaBhopConfig.SV_AIRACCELERATE.set(BhopClient.svAirAccelerate);
+                          HerdaBhopConfig.AIR_WISH_CAP_UPS.set(BhopClient.airWishCapUps);
                           this.init();
                       }
                   ).bounds(cx - bw / 2, startY + step * 2, bw, bh).build());
 
-                  // 4. Сила ускорения в воздухе (sv_airaccelerate)
                   this.addRenderableWidget(Button.builder(
-                      Component.literal(String.format("Air-Accelerate: §e%.2fx (%s)", BhopClient.airAccel, getAccelPresetName(BhopClient.airAccel))),
+                      Component.literal("W-Key in Air: " + (BhopClient.strictWRelease ? "§6Strict CS2 (Must Release W)" : "§aSmart CS2 (A/D Overrides W)")),
                       btn -> {
-                          if (BhopClient.airAccel < 1.0) BhopClient.airAccel = 1.25;
-                          else if (BhopClient.airAccel < 1.5) BhopClient.airAccel = 1.75;
-                          else if (BhopClient.airAccel < 2.2) BhopClient.airAccel = 2.50;
-                          else BhopClient.airAccel = 0.75;
-                          HerdaBhopConfig.AIR_ACCELERATE.set(BhopClient.airAccel);
+                          BhopClient.strictWRelease = !BhopClient.strictWRelease;
+                          HerdaBhopConfig.STRICT_W_RELEASE.set(BhopClient.strictWRelease);
                           this.init();
                       }
                   ).bounds(cx - bw / 2, startY + step * 3, bw, bh).build());
 
-                  // 5. Множитель прироста скорости за каждый прыжок
+                  int bonusPct = (int) Math.round((BhopClient.hopBoost - 1.0) * 100.0);
                   this.addRenderableWidget(Button.builder(
-                      Component.literal(String.format("Hop Speed Boost: §b+%.0f%% per hop", (BhopClient.hopBoost - 1.0) * 100.0)),
+                      Component.literal("Extra Landing Boost: §b" + (bonusPct == 0 ? "0% (Pure Strafe Only)" : ("+" + bonusPct + "% per jump"))),
                       btn -> {
-                          if (BhopClient.hopBoost < 1.10) BhopClient.hopBoost = 1.14;
-                          else if (BhopClient.hopBoost < 1.18) BhopClient.hopBoost = 1.22;
-                          else if (BhopClient.hopBoost < 1.30) BhopClient.hopBoost = 1.35;
-                          else BhopClient.hopBoost = 1.06;
+                          if (BhopClient.hopBoost <= 1.005) BhopClient.hopBoost = 1.05;
+                          else if (BhopClient.hopBoost <= 1.06) BhopClient.hopBoost = 1.10;
+                          else if (BhopClient.hopBoost <= 1.11) BhopClient.hopBoost = 1.16;
+                          else BhopClient.hopBoost = 1.00;
                           HerdaBhopConfig.HOP_SPEED_BOOST.set(BhopClient.hopBoost);
                           this.init();
                       }
                   ).bounds(cx - bw / 2, startY + step * 4, bw, bh).build());
 
-                  // 6. Лимит максимальной скорости (u/s)
-                  int maxUnits = (int) Math.round(BhopClient.maxSpeedCap * BhopMath.CS2_UNITS_PER_BLOCK_TICK);
                   this.addRenderableWidget(Button.builder(
-                      Component.literal("Max Speed Cap: §d" + maxUnits + " u/s"),
+                      Component.literal("Max Speed Cap: §d" + (int) Math.round(BhopClient.maxSpeedUps) + " u/s"),
                       btn -> {
-                          if (BhopClient.maxSpeedCap < 0.6) BhopClient.maxSpeedCap = 0.78;      // ~900 u/s
-                          else if (BhopClient.maxSpeedCap < 1.0) BhopClient.maxSpeedCap = 1.15; // ~1330 u/s
-                          else if (BhopClient.maxSpeedCap < 1.6) BhopClient.maxSpeedCap = 1.80; // ~2080 u/s
-                          else BhopClient.maxSpeedCap = 0.45;                                   // ~520 u/s
-                          HerdaBhopConfig.MAX_SPEED_CAP.set(BhopClient.maxSpeedCap);
+                          if (BhopClient.maxSpeedUps < 700.0) BhopClient.maxSpeedUps = 950.0;
+                          else if (BhopClient.maxSpeedUps < 1100.0) BhopClient.maxSpeedUps = 1400.0;
+                          else if (BhopClient.maxSpeedUps < 1800.0) BhopClient.maxSpeedUps = 2500.0;
+                          else BhopClient.maxSpeedUps = 600.0;
+                          HerdaBhopConfig.MAX_SPEED_UPS.set(BhopClient.maxSpeedUps);
                           this.init();
                       }
                   ).bounds(cx - bw / 2, startY + step * 5, bw, bh).build());
 
-                  // 7. Отображение HUD и Кейстроков
                   this.addRenderableWidget(Button.builder(
-                      Component.literal("CS2 Velocity HUD: " + (BhopClient.showHud ? "§aON" : "§cOFF") + " | Keys: " + (BhopClient.showKeystrokes ? "§aON" : "§cOFF")),
+                      Component.literal("HUD: " + (BhopClient.showHud ? "§aON" : "§cOFF") + " | Keystrokes: " + (BhopClient.showKeystrokes ? "§aON" : "§cOFF")),
                       btn -> {
                           if (BhopClient.showHud && BhopClient.showKeystrokes) {
                               BhopClient.showKeystrokes = false;
@@ -411,26 +448,25 @@ jobs:
                       }
                   ).bounds(cx - bw / 2, startY + step * 6, bw, bh).build());
 
-                  // 8. Готово / Закрыть
                   this.addRenderableWidget(Button.builder(
                       Component.literal("§aDone & Save"),
                       btn -> this.onClose()
                   ).bounds(cx - bw / 2, startY + step * 7 + 4, bw, bh).build());
               }
 
-              private static String getAccelPresetName(double val) {
-                  if (val <= 0.8) return "Competitive";
-                  if (val <= 1.35) return "CS2 Default";
-                  if (val <= 1.9) return "Bhop Server";
-                  return "Surf / Insane";
+              private static String getPresetName(double wishCap) {
+                  if (wishCap <= 32.0) return "CS2 Competitive (sv_aa 12)";
+                  if (wishCap <= 44.0) return "CS2 Bhop Server (sv_aa 100)";
+                  if (wishCap <= 58.0) return "CS2 KZ / Pro (sv_aa 150)";
+                  return "CS2 Surf / Insane (sv_aa 250)";
               }
 
               @Override
               public void render(GuiGraphics gg, int mouseX, int mouseY, float partialTick) {
                   this.renderBackground(gg);
                   int cx = this.width / 2;
-                  gg.fill(cx - 125, 12, cx + 125, this.height - 10, 0xAA0B131E);
-                  gg.drawCenteredString(this.font, "§b§lHERDA CS2 BUNNYHOP SETTINGS", cx, 18, 0xFFFFFFFF);
+                  gg.fill(cx - 135, 10, cx + 135, this.height - 10, 0xAA0B131E);
+                  gg.drawCenteredString(this.font, "§b§lHERDA CS2 BUNNYHOP & STRAFE ENGINE", cx, 16, 0xFFFFFFFF);
                   super.render(gg, mouseX, mouseY, partialTick);
               }
 
@@ -448,12 +484,15 @@ jobs:
           import net.minecraft.client.KeyMapping;
           import net.minecraft.client.Minecraft;
           import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.player.Input;
           import net.minecraft.client.player.LocalPlayer;
           import net.minecraft.network.chat.Component;
-          import net.minecraft.util.Mth;
           import net.minecraft.world.phys.Vec3;
+          import net.minecraftforge.client.event.ComputeFovModifierEvent;
+          import net.minecraftforge.client.event.MovementInputUpdateEvent;
           import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
           import net.minecraftforge.client.event.RenderGuiOverlayEvent;
+          import net.minecraftforge.client.gui.overlay.VanillaGuiOverlay;
           import net.minecraftforge.common.MinecraftForge;
           import net.minecraftforge.event.TickEvent;
           import net.minecraftforge.eventbus.api.IEventBus;
@@ -470,22 +509,44 @@ jobs:
               public static boolean bhopEnabled = true;
               public static boolean autoJump = true;
               public static boolean airStrafe = true;
+              public static boolean strictWRelease = false;
               public static boolean showHud = true;
               public static boolean showKeystrokes = true;
-              public static double hopBoost = 1.14;
-              public static double airAccel = 1.25;
-              public static double maxSpeedCap = 0.78;
+              public static double svAirAccelerate = 100.0;
+              public static double airWishCapUps = 42.0;
+              public static double hopBoost = 1.00;
+              public static double maxSpeedUps = 950.0;
+
+              // Authoritative CS2 horizontal velocity state (blocks/tick)
+              private static double csVelX = 0.0;
+              private static double csVelZ = 0.0;
+              private static boolean hasCsVelocity = false;
+              private static boolean activeCsStepThisTick = false;
 
               private static int bhopStreak = 0;
               private static int groundTicks = 0;
               private static float lastYaw = 0.0F;
+              private static boolean yawInitialized = false;
+
               private static int currentUnitsPerSec = 0;
               private static int peakUnitsPerSec = 0;
-              private static float strafeSyncBar = 0.0F;
+              private static int strafeSyncPercent = 100;
+              private static double syncAccum = 0.0;
+              private static int syncSamples = 0;
+
+              // Raw key states for accurate Keystrokes HUD even when vanilla input is suppressed
+              private static boolean rawW = false;
+              private static boolean rawA = false;
+              private static boolean rawS = false;
+              private static boolean rawD = false;
+              private static boolean rawJump = false;
 
               public static void init(IEventBus modBus) {
                   modBus.addListener(BhopClient::onRegisterKeys);
+                  MinecraftForge.EVENT_BUS.addListener(BhopClient::onMovementInput);
+                  MinecraftForge.EVENT_BUS.addListener(BhopClient::onPlayerPostTick);
                   MinecraftForge.EVENT_BUS.addListener(BhopClient::onClientTick);
+                  MinecraftForge.EVENT_BUS.addListener(BhopClient::onFovModifier);
                   MinecraftForge.EVENT_BUS.addListener(BhopClient::onRenderHud);
               }
 
@@ -499,145 +560,279 @@ jobs:
                   Minecraft mc = Minecraft.getInstance();
                   LocalPlayer player = mc.player;
                   if (player == null || mc.level == null) {
-                      bhopStreak = 0;
-                      currentUnitsPerSec = 0;
+                      resetState();
                       return;
                   }
 
                   while (KEY_TOGGLE.consumeClick()) {
                       bhopEnabled = !bhopEnabled;
                       HerdaBhopConfig.BHOP_ENABLED.set(bhopEnabled);
+                      if (!bhopEnabled) resetState();
                       player.displayClientMessage(Component.literal(
-                          bhopEnabled ? "§a[CS2 Bhop] Enabled! Hold SPACE and strafe A/D + Mouse." : "§c[CS2 Bhop] Disabled."
+                          bhopEnabled
+                              ? "§a[CS2 Bhop] ON — Hold SPACE + Strafe A (mouse left) / D (mouse right)"
+                              : "§c[CS2 Bhop] OFF"
                       ), true);
                   }
 
                   while (KEY_SETTINGS.consumeClick()) {
                       mc.setScreen(new BhopSettingsScreen());
                   }
+              }
 
-                  Vec3 vel = player.getDeltaMovement();
-                  currentUnitsPerSec = BhopMath.toCs2UnitsPerSec(vel.x, vel.z);
-                  if (currentUnitsPerSec > peakUnitsPerSec) {
-                      peakUnitsPerSec = currentUnitsPerSec;
+              private static void resetState() {
+                  csVelX = 0.0;
+                  csVelZ = 0.0;
+                  hasCsVelocity = false;
+                  activeCsStepThisTick = false;
+                  bhopStreak = 0;
+                  groundTicks = 0;
+                  currentUnitsPerSec = 0;
+                  yawInitialized = false;
+              }
+
+              /**
+               * Runs inside LocalPlayer.aiStep() right after keyboard reading and BEFORE vanilla jumpFromGround() and travel().
+               */
+              private static void onMovementInput(MovementInputUpdateEvent event) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (!(event.getEntity() instanceof LocalPlayer player) || player != mc.player) return;
+
+                  activeCsStepThisTick = false;
+                  Input input = event.getInput();
+
+                  rawW = input.up;
+                  rawS = input.down;
+                  rawA = input.left;
+                  rawD = input.right;
+                  rawJump = input.jumping;
+
+                  float currYaw = player.getYRot();
+                  if (!yawInitialized) {
+                      lastYaw = currYaw;
+                      yawInitialized = true;
                   }
+                  float prevYaw = lastYaw;
+                  lastYaw = currYaw;
 
-                  float yawNow = player.getYRot();
-                  float mouseYawDelta = Mth.wrapDegrees(yawNow - lastYaw);
-                  lastYaw = yawNow;
-
-                  if (!bhopEnabled || mc.screen != null) return;
-                  if (player.isInWater() || player.isInLava() || player.isPassenger() || player.getAbilities().flying || player.isShiftKeyDown()) {
-                      bhopStreak = 0;
+                  if (!bhopEnabled || mc.screen != null) {
+                      hasCsVelocity = false;
+                      Vec3 v = player.getDeltaMovement();
+                      currentUnitsPerSec = BhopMath.toCs2UnitsPerSec(v.x, v.z);
                       return;
                   }
 
-                  boolean jumpHeld = mc.options.keyJump.isDown();
-                  float forward = player.input.forwardImpulse;
-                  float strafe = player.input.leftImpulse;
-                  boolean movingInput = Math.abs(forward) > 0.05F || Math.abs(strafe) > 0.05F;
+                  if (player.isInWater() || player.isInLava() || player.isPassenger()
+                          || player.getAbilities().flying || player.isFallFlying()
+                          || player.onClimbable() || input.shiftKeyDown) {
+                      hasCsVelocity = false;
+                      bhopStreak = 0;
+                      Vec3 v = player.getDeltaMovement();
+                      currentUnitsPerSec = BhopMath.toCs2UnitsPerSec(v.x, v.z);
+                      return;
+                  }
+
+                  // If player took external knockback this exact tick, sync velocity from entity
+                  if (player.hurtTime > 0 && player.hurtTime == player.hurtDuration) {
+                      Vec3 kb = player.getDeltaMovement();
+                      csVelX = kb.x;
+                      csVelZ = kb.z;
+                      hasCsVelocity = true;
+                  }
+
+                  float fmove = (rawW ? 1.0F : 0.0F) - (rawS ? 1.0F : 0.0F);
+                  float smove = (rawD ? 1.0F : 0.0F) - (rawA ? 1.0F : 0.0F); // +1 Right (D), -1 Left (A)
+                  boolean anyMoveKey = Math.abs(fmove) > 0.01F || Math.abs(smove) > 0.01F;
 
                   if (player.onGround()) {
-                      groundTicks++;
-                      if (jumpHeld && autoJump && movingInput) {
-                          // Мгновенный прыжок в первый же тик касания земли без потери инерции (Frame-Perfect Bhop)
-                          player.jumpFromGround();
+                      if (rawJump && autoJump) {
+                          // === CS2 FRAME-PERFECT AUTO-BHOP TAKEOFF ===
+                          if (!hasCsVelocity || bhopStreak == 0) {
+                              Vec3 cur = player.getDeltaMovement();
+                              csVelX = cur.x;
+                              csVelZ = cur.z;
+                              hasCsVelocity = true;
+                          }
+
+                          double curSpeed = Math.hypot(csVelX, csVelZ);
+                          if (curSpeed < BhopMath.BASE_KNIFE_SPEED_BPT && anyMoveKey) {
+                              // First jump from standstill/walk: launch cleanly at 250 u/s knife speed along wishdir
+                              double[] wishDir = BhopMath.computeWishDir(currYaw, fmove, smove);
+                              csVelX = wishDir[0] * BhopMath.BASE_KNIFE_SPEED_BPT;
+                              csVelZ = wishDir[1] * BhopMath.BASE_KNIFE_SPEED_BPT;
+                          } else if (curSpeed >= BhopMath.BASE_KNIFE_SPEED_BPT && hopBoost > 1.0001D) {
+                              // Optional extra landing boost if configured in K menu
+                              double maxBpt = maxSpeedUps / BhopMath.CS2_UNITS_PER_BLOCK_TICK;
+                              double targetSpeed = Math.min(maxBpt, curSpeed * hopBoost);
+                              double scale = targetSpeed / curSpeed;
+                              csVelX *= scale;
+                              csVelZ *= scale;
+                          }
+
+                          // Also run 1 air-accelerate step on the jump frame so strafing has zero dead ticks
+                          if (airStrafe) {
+                              double[] stepped = BhopMath.stepSourceAirAccelerate(
+                                  csVelX, csVelZ, prevYaw, currYaw, fmove, smove,
+                                  strictWRelease, svAirAccelerate, airWishCapUps, maxSpeedUps
+                              );
+                              csVelX = stepped[0];
+                              csVelZ = stepped[1];
+                          }
+
+                          double jumpVy = 0.42D + player.getJumpBoostPower();
+                          player.setDeltaMovement(csVelX, jumpVy, csVelZ);
+                          player.setOnGround(false);
+                          player.hasImpulse = true;
+
+                          // Suppress vanilla jumpFromGround() (no 10-tick delay, no sprint camera snap) and vanilla ground drag
+                          input.jumping = false;
+                          input.forwardImpulse = 0.0F;
+                          input.leftImpulse = 0.0F;
+
+                          activeCsStepThisTick = true;
                           bhopStreak++;
                           groundTicks = 0;
-
-                          Vec3 afterJump = player.getDeltaMovement();
-                          double curSpeed = Math.sqrt(afterJump.x * afterJump.x + afterJump.z * afterJump.z);
-                          double baseSpeed = Math.max(curSpeed, 0.245);
-                          double boostedSpeed = Math.min(maxSpeedCap, baseSpeed * hopBoost);
-
-                          // Направляем вектор прыжка по текущему курсу и стрейфу
-                          double moveYaw = getMoveDirectionRadians(yawNow, forward, strafe);
-                          double nx = -Math.sin(moveYaw) * boostedSpeed;
-                          double nz =  Math.cos(moveYaw) * boostedSpeed;
-                          player.setDeltaMovement(nx, afterJump.y, nz);
-                      } else if (groundTicks > 4) {
-                          bhopStreak = 0;
-                          peakUnitsPerSec = currentUnitsPerSec;
+                          net.minecraftforge.common.ForgeHooks.onLivingJump(player);
+                      } else {
+                          // On the ground without holding SPACE
+                          groundTicks++;
+                          if (groundTicks <= 2 && hasCsVelocity && bhopStreak > 0) {
+                              // 2-tick CS2 sub-tick scroll/tap grace window: preserve bhop speed for 2 ticks
+                              Vec3 cur = player.getDeltaMovement();
+                              player.setDeltaMovement(csVelX, cur.y, csVelZ);
+                              input.forwardImpulse = 0.0F;
+                              input.leftImpulse = 0.0F;
+                              activeCsStepThisTick = true;
+                          } else {
+                              // Normal ground walking/running
+                              if (groundTicks > 2) {
+                                  bhopStreak = 0;
+                                  syncAccum = 0.0;
+                                  syncSamples = 0;
+                              }
+                              Vec3 cur = player.getDeltaMovement();
+                              csVelX = cur.x;
+                              csVelZ = cur.z;
+                              hasCsVelocity = true;
+                          }
                       }
                   } else {
+                      // === CS2 AIRBORNE TICK (SV_AirAccelerate, ZERO AIR DRAG) ===
                       groundTicks = 0;
-                      if (airStrafe) {
-                          Vec3 airVel = player.getDeltaMovement();
-                          double[] nextXZ = BhopMath.applySourceAirAccelerate(
-                              airVel.x, airVel.z,
-                              yawNow, forward, strafe,
-                              mouseYawDelta,
-                              airAccel, maxSpeedCap
-                          );
-                          player.setDeltaMovement(nextXZ[0], airVel.y, nextXZ[1]);
-
-                          // Индикатор синхронизации стрейфа для HUD
-                          boolean synced = (mouseYawDelta > 0.2F && strafe > 0.1F) || (mouseYawDelta < -0.2F && strafe < -0.1F);
-                          strafeSyncBar = Mth.lerp(0.25F, strafeSyncBar, synced ? 1.0F : 0.35F);
+                      if (!hasCsVelocity) {
+                          Vec3 cur = player.getDeltaMovement();
+                          csVelX = cur.x;
+                          csVelZ = cur.z;
+                          hasCsVelocity = true;
                       }
+
+                      if (airStrafe) {
+                          double[] stepped = BhopMath.stepSourceAirAccelerate(
+                              csVelX, csVelZ, prevYaw, currYaw, fmove, smove,
+                              strictWRelease, svAirAccelerate, airWishCapUps, maxSpeedUps
+                          );
+                          csVelX = stepped[0];
+                          csVelZ = stepped[1];
+
+                          float dyaw = Math.abs(BhopMath.wrapDegrees(currYaw - prevYaw));
+                          if (dyaw > 0.15F && Math.abs(smove) > 0.01F) {
+                              syncAccum += stepped[2];
+                              syncSamples++;
+                              strafeSyncPercent = (int) Math.round((syncAccum / syncSamples) * 100.0);
+                          }
+                      }
+
+                      // Zero vanilla air moveRelative so only pure Source Engine SV_AirAccelerate moves the player
+                      input.forwardImpulse = 0.0F;
+                      input.leftImpulse = 0.0F;
+
+                      Vec3 cur = player.getDeltaMovement();
+                      player.setDeltaMovement(csVelX, cur.y, csVelZ);
+                      activeCsStepThisTick = true;
+                  }
+
+                  currentUnitsPerSec = BhopMath.toCs2UnitsPerSec(csVelX, csVelZ);
+                  if (currentUnitsPerSec > peakUnitsPerSec) {
+                      peakUnitsPerSec = currentUnitsPerSec;
                   }
               }
 
-              private static double getMoveDirectionRadians(float yawDeg, float forward, float strafe) {
-                  float moveYaw = yawDeg;
-                  if (forward < 0.0F) {
-                      moveYaw += 180.0F;
+              /**
+               * Runs at the end of Player.tick() right after LivingEntity.travel() and Entity.move().
+               * Respects wall collisions while stripping out Minecraft's 0.91 air drag and 0.546 ground drag.
+               */
+              private static void onPlayerPostTick(TickEvent.PlayerTickEvent event) {
+                  if (event.phase != TickEvent.Phase.END) return;
+                  Minecraft mc = Minecraft.getInstance();
+                  if (event.player != mc.player || !activeCsStepThisTick) return;
+
+                  LocalPlayer player = mc.player;
+                  Vec3 afterTravel = player.getDeltaMovement();
+
+                  // If Entity.move() hit a block along X or Z, zero that component (Source ClipVelocity)
+                  if (Math.abs(csVelX) > 1.0E-4D && Math.abs(afterTravel.x) < Math.abs(csVelX) * 0.25D) {
+                      csVelX = afterTravel.x;
                   }
-                  float factor = 1.0F;
-                  if (forward < 0.0F) factor = -0.5F;
-                  else if (forward > 0.0F) factor = 0.5F;
+                  if (Math.abs(csVelZ) > 1.0E-4D && Math.abs(afterTravel.z) < Math.abs(csVelZ) * 0.25D) {
+                      csVelZ = afterTravel.z;
+                  }
 
-                  if (strafe > 0.0F) moveYaw -= 90.0F * factor;
-                  if (strafe < 0.0F) moveYaw += 90.0F * factor;
+                  // Restore exact CS2 horizontal velocity so Minecraft's 0.91 drag never slows air flight
+                  player.setDeltaMovement(csVelX, afterTravel.y, csVelZ);
+                  currentUnitsPerSec = BhopMath.toCs2UnitsPerSec(csVelX, csVelZ);
+                  if (currentUnitsPerSec > peakUnitsPerSec) {
+                      peakUnitsPerSec = currentUnitsPerSec;
+                  }
+              }
 
-                  return Math.toRadians(moveYaw);
+              private static void onFovModifier(ComputeFovModifierEvent event) {
+                  if (!bhopEnabled) return;
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.player == null) return;
+                  if (bhopStreak > 0 || !mc.player.onGround()) {
+                      // Keep camera FOV rock-steady while bhopping so releasing W doesn't twitch the screen
+                      event.setNewFovModifier(1.0F);
+                  }
               }
 
               private static void onRenderHud(RenderGuiOverlayEvent.Post event) {
                   if (!showHud || !bhopEnabled) return;
+                  if (event.getOverlay() != VanillaGuiOverlay.HOTBAR.type()) return;
+
                   Minecraft mc = Minecraft.getInstance();
                   LocalPlayer player = mc.player;
-                  if (player == null) return;
+                  if (player == null || mc.options.hideGui) return;
 
                   GuiGraphics gg = event.getGuiGraphics();
                   int sw = mc.getWindow().getGuiScaledWidth();
                   int sh = mc.getWindow().getGuiScaledHeight();
 
                   int cx = sw / 2;
-                  int hudY = sh - 68;
+                  int hudY = sh - 72;
 
-                  // Цвет скорости в стиле CS2 KZ/Bhop таймеров
                   int speedColor = 0xFFFFFFFF;
-                  if (currentUnitsPerSec >= 600) speedColor = 0xFF38BDF8;      // Cyan (Godlike speed)
-                  else if (currentUnitsPerSec >= 400) speedColor = 0xFFFACC15; // Gold (Fast bhop)
-                  else if (currentUnitsPerSec >= 260) speedColor = 0xFF4ADE80; // Green (Above knife speed)
+                  if (currentUnitsPerSec >= 600) speedColor = 0xFF38BDF8;      // Cyan
+                  else if (currentUnitsPerSec >= 400) speedColor = 0xFFFACC15; // Gold
+                  else if (currentUnitsPerSec >= 255) speedColor = 0xFF4ADE80; // Green
 
-                  gg.fill(cx - 66, hudY - 4, cx + 66, hudY + 26, 0x990B131E);
+                  gg.fill(cx - 78, hudY - 4, cx + 78, hudY + 26, 0xAA0B131E);
                   String speedStr = currentUnitsPerSec + " u/s";
-                  String subStr = "STREAK: " + bhopStreak + "x  |  PEAK: " + peakUnitsPerSec;
+                  String subStr = "SYNC: " + strafeSyncPercent + "% | JUMPS: " + bhopStreak + " | PEAK: " + peakUnitsPerSec;
 
                   gg.drawCenteredString(mc.font, speedStr, cx, hudY, speedColor);
-                  gg.drawCenteredString(mc.font, subStr, cx, hudY + 12, 0xFFCBD5E1);
+                  gg.drawCenteredString(mc.font, subStr, cx, hudY + 11, 0xFFCBD5E1);
 
-                  // Полоска ускорения / синхронизации стрейфа
-                  int barWidth = Math.min(124, (int) (currentUnitsPerSec * 124.0 / 900.0));
-                  gg.fill(cx - 62, hudY + 22, cx - 62 + barWidth, hudY + 24, speedColor);
+                  int barWidth = Math.min(148, (int) (currentUnitsPerSec * 148.0 / Math.max(300.0, maxSpeedUps)));
+                  gg.fill(cx - 74, hudY + 22, cx - 74 + barWidth, hudY + 24, speedColor);
 
-                  // Блок Keystrokes (W A S D + SPACE) справа внизу
                   if (showKeystrokes) {
                       int kx = sw - 74;
                       int ky = sh - 64;
-                      boolean w = mc.options.keyUp.isDown();
-                      boolean a = mc.options.keyLeft.isDown();
-                      boolean s = mc.options.keyDown.isDown();
-                      boolean d = mc.options.keyRight.isDown();
-                      boolean jmp = mc.options.keyJump.isDown();
-
-                      drawKeyBox(gg, mc, kx + 20, ky, 18, 18, "W", w);
-                      drawKeyBox(gg, mc, kx, ky + 20, 18, 18, "A", a);
-                      drawKeyBox(gg, mc, kx + 20, ky + 20, 18, 18, "S", s);
-                      drawKeyBox(gg, mc, kx + 40, ky + 20, 18, 18, "D", d);
-                      drawKeyBox(gg, mc, kx, ky + 40, 58, 14, "JUMP", jmp);
+                      drawKeyBox(gg, mc, kx + 20, ky, 18, 18, "W", rawW);
+                      drawKeyBox(gg, mc, kx, ky + 20, 18, 18, "A", rawA);
+                      drawKeyBox(gg, mc, kx + 20, ky + 20, 18, 18, "S", rawS);
+                      drawKeyBox(gg, mc, kx + 40, ky + 20, 18, 18, "D", rawD);
+                      drawKeyBox(gg, mc, kx, ky + 40, 58, 14, "SPACE", rawJump);
                   }
               }
 
@@ -658,32 +853,57 @@ jobs:
 
           public class BhopMathTest {
               @Test
-              public void testCs2UnitsConversion() {
+              public void testKnifeSpeedConversion() {
                   assertEquals(0, BhopMath.toCs2UnitsPerSec(0.0, 0.0));
-                  int knifeSpeed = BhopMath.toCs2UnitsPerSec(0.216, 0.0);
-                  assertTrue(knifeSpeed >= 245 && knifeSpeed <= 255);
+                  assertEquals(250, BhopMath.toCs2UnitsPerSec(0.25, 0.0));
               }
 
               @Test
-              public void testAirAccelerateIncreasesSpeedWithinCap() {
-                  double[] v = BhopMath.applySourceAirAccelerate(0.20, 0.0, 0.0F, 1.0F, 1.0F, -4.5F, 1.25, 0.78);
-                  double speed = Math.sqrt(v[0] * v[0] + v[1] * v[1]);
-                  assertTrue(speed > 0.20);
-                  assertTrue(speed <= 0.7801);
+              public void testAirCoastingHasZeroDrag() {
+                  double[] coast = BhopMath.stepSourceAirAccelerate(0.0, 0.42, 0.0F, 0.0F, 0.0F, 0.0F, false, 100.0, 42.0, 950.0);
+                  assertEquals(0.42, Math.hypot(coast[0], coast[1]), 1.0E-9);
+              }
+
+              @Test
+              public void testSyncedLeftAndRightStrafeGainsSpeedAndTurnsVector() {
+                  double vx = 0.0, vz = 0.25;
+                  float yaw = 0.0F;
+                  for (int t = 0; t < 12; t++) {
+                      float nextYaw = yaw - 6.0F;
+                      double[] r = BhopMath.stepSourceAirAccelerate(vx, vz, yaw, nextYaw, 0.0F, -1.0F, false, 100.0, 42.0, 950.0);
+                      vx = r[0]; vz = r[1]; yaw = nextYaw;
+                  }
+                  int afterJump1 = BhopMath.toCs2UnitsPerSec(vx, vz);
+                  assertTrue(afterJump1 >= 295, "Jump 1 left strafe should gain speed, got " + afterJump1);
+                  assertTrue(vx > 0.20, "Velocity vector must curve left (+X) with camera");
+
+                  for (int t = 0; t < 12; t++) {
+                      float nextYaw = yaw + 6.0F;
+                      double[] r = BhopMath.stepSourceAirAccelerate(vx, vz, yaw, nextYaw, 0.0F, 1.0F, false, 100.0, 42.0, 950.0);
+                      vx = r[0]; vz = r[1]; yaw = nextYaw;
+                  }
+                  int afterJump2 = BhopMath.toCs2UnitsPerSec(vx, vz);
+                  assertTrue(afterJump2 > afterJump1 + 35, "Jump 2 right strafe should gain more speed, got " + afterJump2);
+              }
+
+              @Test
+              public void testHoldingWOnlyDoesNotGainBhopSpeed() {
+                  double[] wOnly = BhopMath.stepSourceAirAccelerate(0.0, 0.30, 0.0F, -6.0F, 1.0F, 0.0F, false, 100.0, 42.0, 950.0);
+                  assertEquals(0.30, Math.hypot(wOnly[0], wOnly[1]), 1.0E-6);
               }
           }
           """)
 
-          with zipfile.ZipFile("herdabhop-1.0.0-source.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+          with zipfile.ZipFile("herdabhop-2.0.0-source.zip", "w", zipfile.ZIP_DEFLATED) as zf:
               for root, _, files in os.walk("."):
                   if root.startswith("./.git"):
                       continue
                   for fn in files:
-                      if fn == "herdabhop-1.0.0-source.zip":
+                      if fn == "herdabhop-2.0.0-source.zip":
                           continue
                       full = os.path.join(root, fn)
                       zf.write(full, os.path.relpath(full, "."))
-          print("HerdaBhop CS2 files generated successfully!")
+          print("HerdaBhop 2.0 CS2 project files generated successfully!")
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -696,7 +916,7 @@ jobs:
           curl -sL https://services.gradle.org/distributions/gradle-8.8-bin.zip -o gradle.zip
           unzip -q gradle.zip
           ./gradle-8.8/bin/gradle --no-daemon test build --stacktrace 2>&1 | tee build.log
-          cp build/libs/herdabhop-1.0.0.jar ./herdabhop-1.0.0.jar
+          cp build/libs/herdabhop-2.0.0.jar ./herdabhop-2.0.0.jar
 
       - name: Print Compiler Log on Failure
         if: failure()
@@ -706,10 +926,10 @@ jobs:
           tail -n 90 build.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Compiled herdabhop-1.0.0.jar & Source ZIP
+      - name: Upload Compiled herdabhop-2.0.0.jar & Source ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: herdabhop-1.0.0-release
+          name: herdabhop-2.0.0-release
           path: |
-            herdabhop-1.0.0.jar
-            herdabhop-1.0.0-source.zip
+            herdabhop-2.0.0.jar
+            herdabhop-2.0.0-source.zip
